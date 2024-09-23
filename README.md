@@ -99,13 +99,14 @@ The init container requires the following environment variables:
 
 1. Waits for the InfluxDB instance to be ready
 2. Authenticates using the provided admin token
-3. Creates the specified organization
-4. Creates the specified bucket
-5. Creates a user with the given username and password
-6. Grants the user full access to the created bucket
+3. Checks if the specified organization exists, creates it if it doesn't
+4. Checks if the specified bucket exists, creates it if it doesn't
+5. Checks if the specified user exists, creates it if it doesn't
+6. Grants the user full access to the bucket
 
 The init container runs to completion before the main InfluxDB container starts, ensuring that the InfluxDB instance is properly initialized with the desired configuration.
 
 ## Note
 
-Ensure that the InfluxDB instance is configured to use the same organization, bucket, and credentials that you specify in the init container's environment variables.
+- Ensure that the InfluxDB instance is configured to use the same organization, bucket, and credentials that you specify in the init container's environment variables.
+- The init container is designed to be idempotent. If any of the entities (organization, bucket, or user) already exist, the script will skip their creation and continue with the next step.
