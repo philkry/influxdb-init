@@ -27,7 +27,7 @@ influx user create -n "$INFLUXDB_USER" -p "$INFLUXDB_PASSWORD" -o "$INFLUXDB_ORG
 
 # Grant user full access to the bucket
 BUCKET_ID=$(influx bucket list -o "$INFLUXDB_ORG" --name "$INFLUXDB_BUCKET" --hide-headers --host "${INFLUXDB_HOST}" --token "${INFLUX_TOKEN}" | cut -f 1)
-USER_ID=$(influx user list -o "$INFLUXDB_ORG" -n "$INFLUXDB_USER" --hide-headers --host "${INFLUXDB_HOST}" --token "${INFLUX_TOKEN}" | cut -f 1)
-influx auth create -o "$INFLUXDB_ORG" --user "$USER_ID" --read-bucket "$BUCKET_ID" --write-bucket "$BUCKET_ID" --host "${INFLUXDB_HOST}" --token "${INFLUX_TOKEN}"
+
+influx auth create -o "$INFLUXDB_ORG" --user "$INFLUXDB_USER" --read-bucket "$BUCKET_ID" --write-bucket "$BUCKET_ID" --host "${INFLUXDB_HOST}" --token "${INFLUX_TOKEN}"
 
 echo "InfluxDB initialization completed successfully for host ${INFLUXDB_HOST}."
