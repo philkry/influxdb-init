@@ -21,6 +21,7 @@ The init container requires the following environment variables:
 - `INFLUXDB_BUCKET`: The name of the bucket to create
 - `INFLUXDB_USER`: The username for the new user
 - `INFLUXDB_PASSWORD`: The password for the new user
+- `USER_TOKEN`: Optional token to be created for the new user
 - `INFLUX_TOKEN`: An admin token for authentication (required)
 
 ## Outputs
@@ -30,7 +31,8 @@ The init container does not produce any direct outputs. However, it results in t
 1. Creation of an organization (if it doesn't exist)
 2. Creation of a bucket (if it doesn't exist)
 3. Creation of a user (if it doesn't exist)
-4. Granting full access to the bucket for the user
+4. Creation of a user token (if it doesn't exist and was specified/requested)
+5. Granting full access to the bucket for the user
 
 ## Usage
 

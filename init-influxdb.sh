@@ -40,16 +40,86 @@ else
     echo "User $INFLUXDB_USER already exists."
 fi
 
-# Grant user full access to the bucket
+# Get bucket ID for permissions
 BUCKET_ID=$(influx bucket list -o "$INFLUXDB_ORG" -n "$INFLUXDB_BUCKET" --hide-headers --host "${INFLUXDB_HOST}" --token "${INFLUX_TOKEN}" | cut -f 1)
 
-
-# Check if authorization already exists
-if ! influx auth list -o "$INFLUXDB_ORG" --user "$INFLUXDB_USER" --host "${INFLUXDB_HOST}" --token "${INFLUX_TOKEN}" | grep -q "$BUCKET_ID"; then
-    # Create authorization
-    influx auth create -o "$INFLUXDB_ORG" --user "$INFLUXDB_USER" --read-bucket "$BUCKET_ID" --write-bucket "$BUCKET_ID" --host "${INFLUXDB_HOST}" --token "${INFLUX_TOKEN}"
+# If a predefined USER_TOKEN is provided, create that token
+if [ -n "$USER_TOKEN" ]; then
+    echo "Predefined USER_TOKEN provided, setting up custom token..."
+    
+    # Get the organization ID for token creation
+    ORG_ID=$(influx org list --name "$INFLUXDB_ORG" --hide-headers --host "${INFLUXDB_HOST}" --token "${INFLUX_TOKEN}" | cut -f 1)
+    
+    # Check if our specific token already exists
+    # We'll create a temporary file to store the response
+    TOKEN_RESPONSE=$(mktemp)
+    
+    # Get all authorizations
+    curl -s -X GET "${INFLUXDB_HOST}/api/v2/authorizations" \
+      -H "Authorization: Token ${INFLUX_TOKEN}" > "$TOKEN_RESPONSE"
+    
+    # Look for our specific token value in the response
+    # We can't directly check the token value as it's hidden in API responses
+    # Instead, check if a token with our specific description exists for the user
+    TOKEN_EXISTS=$(grep -c "\"description\":\"service-token-${INFLUXDB_USER}\"" "$TOKEN_RESPONSE" || true)
+    rm "$TOKEN_RESPONSE"
+    
+    if [ "$TOKEN_EXISTS" -eq 0 ]; then
+        # Create token with specific permissions and predefined value using the HTTP API
+        echo "Creating service token for user ${INFLUXDB_USER}..."
+        
+        # Create a temporary file to store the response
+        RESPONSE_FILE=$(mktemp)
+        HTTP_CODE=$(curl -s -o "$RESPONSE_FILE" -w "%{http_code}" -X POST "${INFLUXDB_HOST}/api/v2/authorizations" \
+          -H "Authorization: Token ${INFLUX_TOKEN}" \
+          -H "Content-Type: application/json" \
+          -d '{
+            "description": "service-token-'"${INFLUXDB_USER}"'",
+            "orgID": "'"${ORG_ID}"'",
+            "permissions": [
+              {
+                "action": "read",
+                "resource": {
+                  "type": "buckets",
+                  "id": "'"${BUCKET_ID}"'"
+                }
+              },
+              {
+                "action": "write",
+                "resource": {
+                  "type": "buckets",
+                  "id": "'"${BUCKET_ID}"'"
+                }
+              }
+            ],
+            "token": "'"${USER_TOKEN}"'"
+          }')
+        
+        # Check if the request was successful (2xx status code)
+        if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+            echo "Predefined service token created successfully."
+        else
+            echo "Error creating token. HTTP status code: $HTTP_CODE"
+            echo "Response: $(cat "$RESPONSE_FILE")"
+            rm "$RESPONSE_FILE"
+            exit 1
+        fi
+        
+        rm "$RESPONSE_FILE"
+    else
+        echo "Service token already exists."
+    fi
 else
-    echo "Authorization for user $INFLUXDB_USER on bucket $INFLUXDB_BUCKET already exists."
+    # Traditional user authorization approach (backward compatibility)
+    echo "No predefined USER_TOKEN provided, using standard authorization..."
+    
+    # Check if authorization already exists
+    if ! influx auth list -o "$INFLUXDB_ORG" --user "$INFLUXDB_USER" --host "${INFLUXDB_HOST}" --token "${INFLUX_TOKEN}" | grep -q "$BUCKET_ID"; then
+        # Create authorization
+        influx auth create -o "$INFLUXDB_ORG" --user "$INFLUXDB_USER" --read-bucket "$BUCKET_ID" --write-bucket "$BUCKET_ID" --host "${INFLUXDB_HOST}" --token "${INFLUX_TOKEN}"
+    else
+        echo "Authorization for user $INFLUXDB_USER on bucket $INFLUXDB_BUCKET already exists."
+    fi
 fi
 
 echo "InfluxDB initialization completed successfully for host ${INFLUXDB_HOST}."
