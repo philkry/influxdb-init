@@ -35,7 +35,7 @@ fi
 # Check if user exists
 if ! influx user list --host "${INFLUXDB_HOST}" --token "${INFLUX_TOKEN}" | grep -q "$INFLUXDB_USER"; then
     # Create user
-    influx user create -n "$INFLUXDB_USER" -p "$INFLUXDB_PASSWORD" --host "${INFLUXDB_HOST}" --token "${INFLUX_TOKEN}"
+    influx user create -n "$INFLUXDB_USER" -p "$INFLUXDB_PASSWORD" -o "$INFLUXDB_ORG" --host "${INFLUXDB_HOST}" --token "${INFLUX_TOKEN}"
 else
     echo "User $INFLUXDB_USER already exists."
 fi
