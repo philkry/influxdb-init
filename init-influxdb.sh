@@ -43,122 +43,84 @@ fi
 # Get bucket ID for permissions
 BUCKET_ID=$(influx bucket list -o "$INFLUXDB_ORG" -n "$INFLUXDB_BUCKET" --hide-headers --host "${INFLUXDB_HOST}" --token "${INFLUX_TOKEN}" | cut -f 1)
 
-# If a predefined USER_TOKEN is provided, create that token
-if [ -n "$USER_TOKEN" ]; then
-    echo "Predefined USER_TOKEN provided, setting up custom token..."
+# Token output directory (shared emptyDir volume with main container)
+TOKEN_DIR=${TOKEN_DIR:-/shared/influxdb}
 
-    # Get the organization ID for token creation
-    ORG_ID=$(influx org list --name "$INFLUXDB_ORG" --hide-headers --host "${INFLUXDB_HOST}" --token "${INFLUX_TOKEN}" | cut -f 1)
+# Get the organization ID
+ORG_ID=$(influx org list --name "$INFLUXDB_ORG" --hide-headers --host "${INFLUXDB_HOST}" --token "${INFLUX_TOKEN}" | cut -f 1)
 
-    # Fetch all authorizations and find ones that grant write access to our bucket
+# Fetch all authorizations and find ones that grant write access to our bucket
+AUTH_RESPONSE=$(curl -s -X GET "${INFLUXDB_HOST}/api/v2/authorizations" \
+  -H "Authorization: Token ${INFLUX_TOKEN}")
+
+MATCHING_AUTHS=$(echo "$AUTH_RESPONSE" | jq --arg bid "$BUCKET_ID" \
+  '[.authorizations[] | select(.status == "active") | select(.permissions[]? | .action == "write" and .resource.id == $bid)]')
+
+MATCHING_COUNT=$(echo "$MATCHING_AUTHS" | jq 'length')
+
+# Clean up duplicates — keep only the first matching authorization
+if [ "$MATCHING_COUNT" -gt 1 ]; then
+    echo "Found $MATCHING_COUNT authorizations for bucket — cleaning up duplicates..."
+    KEEP_ID=$(echo "$MATCHING_AUTHS" | jq -r '.[0].id')
+    for AUTH_ID in $(echo "$MATCHING_AUTHS" | jq -r '.[1:][].id'); do
+        echo "  Removing duplicate authorization..."
+        curl -s -o /dev/null -X DELETE \
+          "${INFLUXDB_HOST}/api/v2/authorizations/${AUTH_ID}" \
+          -H "Authorization: Token ${INFLUX_TOKEN}"
+    done
+    # Re-fetch after cleanup
     AUTH_RESPONSE=$(curl -s -X GET "${INFLUXDB_HOST}/api/v2/authorizations" \
       -H "Authorization: Token ${INFLUX_TOKEN}")
-
-    # Find authorization IDs that have write permission on BUCKET_ID
-    MATCHING_AUTH_IDS=$(echo "$AUTH_RESPONSE" | jq -r --arg bid "$BUCKET_ID" \
-      '[.authorizations[] | select(.permissions[]? | .action == "write" and .resource.id == $bid)] | .[].id')
-
-    MATCHING_COUNT=$(echo "$MATCHING_AUTH_IDS" | grep -c . || true)
-
-    if [ "$MATCHING_COUNT" -gt 0 ]; then
-        echo "Found $MATCHING_COUNT existing authorization(s) for bucket $BUCKET_ID."
-
-        # Check if any of them have a token matching USER_TOKEN
-        MATCHING_TOKEN_ID=$(echo "$AUTH_RESPONSE" | jq -r --arg bid "$BUCKET_ID" --arg tok "$USER_TOKEN" \
-          '[.authorizations[] | select(.token == $tok) | select(.permissions[]? | .action == "write" and .resource.id == $bid)] | .[0].id // empty')
-
-        if [ -n "$MATCHING_TOKEN_ID" ]; then
-            echo "Authorization $MATCHING_TOKEN_ID already exists with the correct token. No action needed."
-
-            # Clean up duplicates: remove other auths for the same bucket (keep only the matching one)
-            for AUTH_ID in $MATCHING_AUTH_IDS; do
-                if [ "$AUTH_ID" != "$MATCHING_TOKEN_ID" ]; then
-                    echo "Removing duplicate authorization $AUTH_ID..."
-                    HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE \
-                      "${INFLUXDB_HOST}/api/v2/authorizations/${AUTH_ID}" \
-                      -H "Authorization: Token ${INFLUX_TOKEN}")
-                    if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
-                        echo "  Deleted duplicate $AUTH_ID."
-                    else
-                        echo "  Warning: failed to delete $AUTH_ID (HTTP $HTTP_CODE)."
-                    fi
-                fi
-            done
-        else
-            echo "WARNING: Existing authorization(s) found for bucket $BUCKET_ID but none match the predefined USER_TOKEN."
-            echo "This means InfluxDB previously generated a random token instead of using the predefined value."
-            echo "Removing stale authorizations and creating a new one..."
-
-            for AUTH_ID in $MATCHING_AUTH_IDS; do
-                echo "  Removing stale authorization $AUTH_ID..."
-                curl -s -o /dev/null -X DELETE \
-                  "${INFLUXDB_HOST}/api/v2/authorizations/${AUTH_ID}" \
-                  -H "Authorization: Token ${INFLUX_TOKEN}"
-            done
-
-            # Fall through to create a new token below
-            MATCHING_COUNT=0
-        fi
-    fi
-
-    if [ "$MATCHING_COUNT" -eq 0 ]; then
-        echo "Creating service token for user ${INFLUXDB_USER}..."
-
-        # Build JSON body safely with jq
-        BODY=$(jq -n \
-          --arg desc "service-token-${INFLUXDB_USER}" \
-          --arg orgID "$ORG_ID" \
-          --arg bucketID "$BUCKET_ID" \
-          --arg token "$USER_TOKEN" \
-          '{
-            description: $desc,
-            orgID: $orgID,
-            permissions: [
-              { action: "read", resource: { type: "buckets", id: $bucketID } },
-              { action: "write", resource: { type: "buckets", id: $bucketID } }
-            ],
-            token: $token
-          }')
-
-        RESPONSE_FILE=$(mktemp)
-        HTTP_CODE=$(curl -s -o "$RESPONSE_FILE" -w "%{http_code}" -X POST \
-          "${INFLUXDB_HOST}/api/v2/authorizations" \
-          -H "Authorization: Token ${INFLUX_TOKEN}" \
-          -H "Content-Type: application/json" \
-          -d "$BODY")
-
-        if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
-            # Verify the created token matches the predefined value
-            CREATED_TOKEN=$(jq -r '.token' "$RESPONSE_FILE")
-            if [ "$CREATED_TOKEN" = "$USER_TOKEN" ]; then
-                echo "Service token created successfully and matches predefined value."
-            else
-                echo "ERROR: InfluxDB did not honor the predefined token value."
-                echo "Generated token: $CREATED_TOKEN"
-                echo "You must update the secret store with the generated token above."
-                rm "$RESPONSE_FILE"
-                exit 1
-            fi
-        else
-            echo "Error creating token. HTTP status code: $HTTP_CODE"
-            echo "Response: $(cat "$RESPONSE_FILE")"
-            rm "$RESPONSE_FILE"
-            exit 1
-        fi
-
-        rm "$RESPONSE_FILE"
-    fi
-else
-    # Traditional user authorization approach (backward compatibility)
-    echo "No predefined USER_TOKEN provided, using standard authorization..."
-
-    # Check if authorization already exists
-    if ! influx auth list -o "$INFLUXDB_ORG" --user "$INFLUXDB_USER" --host "${INFLUXDB_HOST}" --token "${INFLUX_TOKEN}" | grep -q "$BUCKET_ID"; then
-        # Create authorization
-        influx auth create -o "$INFLUXDB_ORG" --user "$INFLUXDB_USER" --read-bucket "$BUCKET_ID" --write-bucket "$BUCKET_ID" --host "${INFLUXDB_HOST}" --token "${INFLUX_TOKEN}"
-    else
-        echo "Authorization for user $INFLUXDB_USER on bucket $INFLUXDB_BUCKET already exists."
-    fi
+    MATCHING_AUTHS=$(echo "$AUTH_RESPONSE" | jq --arg bid "$BUCKET_ID" \
+      '[.authorizations[] | select(.status == "active") | select(.permissions[]? | .action == "write" and .resource.id == $bid)]')
+    MATCHING_COUNT=$(echo "$MATCHING_AUTHS" | jq 'length')
 fi
+
+if [ "$MATCHING_COUNT" -eq 1 ]; then
+    echo "Authorization for bucket already exists."
+    SERVICE_TOKEN=$(echo "$MATCHING_AUTHS" | jq -r '.[0].token')
+elif [ "$MATCHING_COUNT" -eq 0 ]; then
+    echo "Creating service authorization for bucket..."
+
+    BODY=$(jq -n \
+      --arg desc "service-token-${INFLUXDB_USER}" \
+      --arg orgID "$ORG_ID" \
+      --arg bucketID "$BUCKET_ID" \
+      '{
+        description: $desc,
+        orgID: $orgID,
+        permissions: [
+          { action: "read", resource: { type: "buckets", id: $bucketID } },
+          { action: "write", resource: { type: "buckets", id: $bucketID } }
+        ]
+      }')
+
+    RESPONSE_FILE=$(mktemp)
+    HTTP_CODE=$(curl -s -o "$RESPONSE_FILE" -w "%{http_code}" -X POST \
+      "${INFLUXDB_HOST}/api/v2/authorizations" \
+      -H "Authorization: Token ${INFLUX_TOKEN}" \
+      -H "Content-Type: application/json" \
+      -d "$BODY")
+
+    if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+        SERVICE_TOKEN=$(jq -r '.token' "$RESPONSE_FILE")
+        echo "Service authorization created successfully."
+    else
+        echo "Error creating authorization. HTTP status code: $HTTP_CODE"
+        rm "$RESPONSE_FILE"
+        exit 1
+    fi
+
+    rm "$RESPONSE_FILE"
+else
+    echo "ERROR: Unexpected state resolving authorizations."
+    exit 1
+fi
+
+# Write token to shared volume for the main container
+mkdir -p "$TOKEN_DIR"
+printf '%s' "$SERVICE_TOKEN" > "${TOKEN_DIR}/token"
+chmod 600 "${TOKEN_DIR}/token"
+echo "Service token written to shared volume."
 
 echo "InfluxDB initialization completed successfully for host ${INFLUXDB_HOST}."
