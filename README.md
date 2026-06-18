@@ -41,7 +41,9 @@ The init container does not produce any direct outputs. However, it results in t
 InfluxDB only returns an authorization's secret token value **once, in the
 create response** — a later `GET /api/v2/authorizations` returns that field
 empty. The script therefore cannot recover the value of a pre-existing token.
-On each run it looks up the authorization it owns (by description) and:
+On each run it looks up the authorization it owns — keyed on write access to
+its bucket, which stays unique even when several services share an
+`INFLUXDB_USER` — and:
 
 - reuses the token only if a usable value is available (i.e. just created);
 - otherwise deletes the stale/unrecoverable authorization(s) and creates a
