@@ -49,18 +49,20 @@ TOKEN_DIR=${TOKEN_DIR:-/shared/influxdb}
 # Get the organization ID
 ORG_ID=$(influx org list --name "$INFLUXDB_ORG" --hide-headers --host "${INFLUXDB_HOST}" --token "${INFLUX_TOKEN}" | cut -f 1)
 
-# Description that uniquely identifies the authorization this script owns.
-# We match on the description (not on bucket permissions) so every lookup and
-# rotation is scoped to *this* service's token and never touches tokens owned
-# by other services that happen to write to the same bucket.
-TOKEN_DESC="service-token-${INFLUXDB_USER}"
+# Label for the authorization this script creates. The bucket is included so
+# the description is unique even when several services share an INFLUXDB_USER.
+TOKEN_DESC="service-token-${INFLUXDB_USER}-${INFLUXDB_BUCKET}"
 
-# Return a JSON array of the authorization(s) this script owns.
+# Return a JSON array of the authorization(s) this script owns. Ownership is
+# keyed on *write access to this bucket* (resource.id), which is the only value
+# that is reliably unique per service — multiple services often share an
+# INFLUXDB_USER (and therefore a description) but each writes its own bucket.
+# Matching on the bucket avoids one service deleting another service's token.
 fetch_owned_auths() {
     curl -s -X GET "${INFLUXDB_HOST}/api/v2/authorizations" \
       -H "Authorization: Token ${INFLUX_TOKEN}" \
-    | jq --arg desc "$TOKEN_DESC" \
-        '[.authorizations[]? | select(.description == $desc)]' 2>/dev/null || echo '[]'
+    | jq --arg bid "$BUCKET_ID" \
+        '[.authorizations[]? | select(.status == "active") | select(.permissions[]? | .action == "write" and .resource.id == $bid)]' 2>/dev/null || echo '[]'
 }
 
 # Create a fresh scoped authorization and echo its token. InfluxDB only ever
