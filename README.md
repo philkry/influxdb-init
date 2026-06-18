@@ -31,8 +31,25 @@ The init container does not produce any direct outputs. However, it results in t
 1. Creation of an organization (if it doesn't exist)
 2. Creation of a bucket (if it doesn't exist)
 3. Creation of a user (if it doesn't exist)
-4. Creation of a user token (if it doesn't exist and was specified/requested)
-5. Granting full access to the bucket for the user
+4. A read/write service authorization scoped to the bucket, identified by the
+   description `service-token-<INFLUXDB_USER>`
+5. The service token value written to `${TOKEN_DIR}/token` (default
+   `/shared/influxdb/token`) for the main container to consume
+
+### Token handling
+
+InfluxDB only returns an authorization's secret token value **once, in the
+create response** — a later `GET /api/v2/authorizations` returns that field
+empty. The script therefore cannot recover the value of a pre-existing token.
+On each run it looks up the authorization it owns (by description) and:
+
+- reuses the token only if a usable value is available (i.e. just created);
+- otherwise deletes the stale/unrecoverable authorization(s) and creates a
+  fresh one, capturing the new token from the create response.
+
+This guarantees the shared volume always ends up with a valid token. The script
+**fails loudly rather than writing an empty token**, so a misconfiguration can
+never silently break the consuming service with `token required` / 401 errors.
 
 ## Usage
 

@@ -49,41 +49,26 @@ TOKEN_DIR=${TOKEN_DIR:-/shared/influxdb}
 # Get the organization ID
 ORG_ID=$(influx org list --name "$INFLUXDB_ORG" --hide-headers --host "${INFLUXDB_HOST}" --token "${INFLUX_TOKEN}" | cut -f 1)
 
-# Fetch all authorizations and find ones that grant write access to our bucket
-AUTH_RESPONSE=$(curl -s -X GET "${INFLUXDB_HOST}/api/v2/authorizations" \
-  -H "Authorization: Token ${INFLUX_TOKEN}")
+# Description that uniquely identifies the authorization this script owns.
+# We match on the description (not on bucket permissions) so every lookup and
+# rotation is scoped to *this* service's token and never touches tokens owned
+# by other services that happen to write to the same bucket.
+TOKEN_DESC="service-token-${INFLUXDB_USER}"
 
-MATCHING_AUTHS=$(echo "$AUTH_RESPONSE" | jq --arg bid "$BUCKET_ID" \
-  '[.authorizations[] | select(.status == "active") | select(.permissions[]? | .action == "write" and .resource.id == $bid)]')
+# Return a JSON array of the authorization(s) this script owns.
+fetch_owned_auths() {
+    curl -s -X GET "${INFLUXDB_HOST}/api/v2/authorizations" \
+      -H "Authorization: Token ${INFLUX_TOKEN}" \
+    | jq --arg desc "$TOKEN_DESC" \
+        '[.authorizations[]? | select(.description == $desc)]' 2>/dev/null || echo '[]'
+}
 
-MATCHING_COUNT=$(echo "$MATCHING_AUTHS" | jq 'length')
-
-# Clean up duplicates — keep only the first matching authorization
-if [ "$MATCHING_COUNT" -gt 1 ]; then
-    echo "Found $MATCHING_COUNT authorizations for bucket — cleaning up duplicates..."
-    KEEP_ID=$(echo "$MATCHING_AUTHS" | jq -r '.[0].id')
-    for AUTH_ID in $(echo "$MATCHING_AUTHS" | jq -r '.[1:][].id'); do
-        echo "  Removing duplicate authorization..."
-        curl -s -o /dev/null -X DELETE \
-          "${INFLUXDB_HOST}/api/v2/authorizations/${AUTH_ID}" \
-          -H "Authorization: Token ${INFLUX_TOKEN}"
-    done
-    # Re-fetch after cleanup
-    AUTH_RESPONSE=$(curl -s -X GET "${INFLUXDB_HOST}/api/v2/authorizations" \
-      -H "Authorization: Token ${INFLUX_TOKEN}")
-    MATCHING_AUTHS=$(echo "$AUTH_RESPONSE" | jq --arg bid "$BUCKET_ID" \
-      '[.authorizations[] | select(.status == "active") | select(.permissions[]? | .action == "write" and .resource.id == $bid)]')
-    MATCHING_COUNT=$(echo "$MATCHING_AUTHS" | jq 'length')
-fi
-
-if [ "$MATCHING_COUNT" -eq 1 ]; then
-    echo "Authorization for bucket already exists."
-    SERVICE_TOKEN=$(echo "$MATCHING_AUTHS" | jq -r '.[0].token')
-elif [ "$MATCHING_COUNT" -eq 0 ]; then
-    echo "Creating service authorization for bucket..."
-
+# Create a fresh scoped authorization and echo its token. InfluxDB only ever
+# returns a token's secret value in this create response — never on a later
+# GET — so this is the ONLY place the value can be captured.
+create_service_token() {
     BODY=$(jq -n \
-      --arg desc "service-token-${INFLUXDB_USER}" \
+      --arg desc "$TOKEN_DESC" \
       --arg orgID "$ORG_ID" \
       --arg bucketID "$BUCKET_ID" \
       '{
@@ -103,17 +88,52 @@ elif [ "$MATCHING_COUNT" -eq 0 ]; then
       -d "$BODY")
 
     if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
-        SERVICE_TOKEN=$(jq -r '.token' "$RESPONSE_FILE")
-        echo "Service authorization created successfully."
+        jq -r '.token // ""' "$RESPONSE_FILE"
+        rm -f "$RESPONSE_FILE"
     else
-        echo "Error creating authorization. HTTP status code: $HTTP_CODE"
-        rm "$RESPONSE_FILE"
-        exit 1
+        echo "Error creating authorization. HTTP status code: $HTTP_CODE" >&2
+        rm -f "$RESPONSE_FILE"
+        return 1
     fi
+}
 
-    rm "$RESPONSE_FILE"
+OWNED_AUTHS=$(fetch_owned_auths)
+OWNED_COUNT=$(echo "$OWNED_AUTHS" | jq 'length' 2>/dev/null || echo 0)
+
+# A token's secret is only returned at creation time. An already-existing
+# authorization comes back from GET with an empty token, so on restarts this
+# is expected to be empty — which is exactly why we must (re)create below
+# instead of trusting whatever GET returns.
+SERVICE_TOKEN=""
+if [ "$OWNED_COUNT" -ge 1 ]; then
+    SERVICE_TOKEN=$(echo "$OWNED_AUTHS" | jq -r '.[0].token // ""')
+fi
+
+if [ -n "$SERVICE_TOKEN" ]; then
+    echo "Reusing existing service authorization."
 else
-    echo "ERROR: Unexpected state resolving authorizations."
+    # Either no authorization exists yet, or one exists but its secret is
+    # unrecoverable (InfluxDB never returns it after creation). Delete any
+    # stale/duplicate owned authorizations and create a fresh one so we end up
+    # holding a token whose value we actually know.
+    if [ "$OWNED_COUNT" -ge 1 ]; then
+        echo "Existing authorization token is unrecoverable; rotating ($OWNED_COUNT stale)..."
+        for AUTH_ID in $(echo "$OWNED_AUTHS" | jq -r '.[].id'); do
+            curl -s -o /dev/null -X DELETE \
+              "${INFLUXDB_HOST}/api/v2/authorizations/${AUTH_ID}" \
+              -H "Authorization: Token ${INFLUX_TOKEN}"
+        done
+    fi
+    echo "Creating service authorization for bucket..."
+    SERVICE_TOKEN=$(create_service_token)
+    echo "Service authorization created successfully."
+fi
+
+# Never write an empty/invalid token to the shared volume. Failing loudly here
+# beats silently breaking the consuming service, which would otherwise see
+# "token required" / 401 on every write with no obvious cause.
+if [ -z "$SERVICE_TOKEN" ] || [ "$SERVICE_TOKEN" = "null" ]; then
+    echo "Error: failed to obtain a valid service token." >&2
     exit 1
 fi
 
